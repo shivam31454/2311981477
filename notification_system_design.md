@@ -168,3 +168,83 @@ data: {"unread_count": 5}
   - The `unread-count` endpoint is highly trafficked. It is cached in Redis (`user:{userId}:unread_count`).
   - Read operations update the Redis cache incrementally (`DECR`) while asynchronously updating the persistent DB (Write-Behind caching).
 - **Database Indexing**: The database uses compound indexes on `(user_id, created_at DESC)` and `(user_id, is_read)` to ensure sub-millisecond pagination and unread filtering.
+
+## Stage 3: Query Optimization & Performance Analysis
+
+### 1. Query Review & Performance Analysis
+
+**Original Query:**
+```sql
+SELECT * FROM notifications
+WHERE studentID = 1042
+AND isRead = false
+ORDER BY createdAt ASC;
+```
+
+**Query Evaluation:**
+While logically correct for fetching unread notifications chronologically, this query is structurally catastrophic for a table with 50,000,000 rows.
+
+**Why it is slow at scale:**
+1. **Full Table Scan ($O(N)$)**: Without a covering index, MySQL scans 50M rows sequentially to find matching `studentID` and `isRead` conditions, resulting in massive disk I/O and CPU spikes.
+2. **The `SELECT *` Impact**: Pulling all columns (especially large `TEXT` bodies or JSON metadata) forces the database to read massive payloads from disk into memory, blowing out the InnoDB Buffer Pool and significantly increasing network latency.
+3. **Sorting Cost (Filesort)**: Without an index supporting the `ORDER BY`, MySQL must load the unindexed filtered results into memory (or a temporary table on disk) to sort them. The computational complexity becomes $O(K \log K)$, where $K$ is the number of filtered rows.
+
+### 2. Optimized Solution & Indexing Strategy
+
+**Optimized Query:**
+```sql
+SELECT id, topic, priority, title, createdAt 
+FROM notifications
+WHERE studentID = 1042 
+  AND isRead = false
+ORDER BY createdAt ASC
+LIMIT 20; -- Enforce pagination
+```
+*We explicitly select only the necessary lightweight fields required to render the notification list, omitting heavy payload bodies.*
+
+**Proper Indexing Strategy:**
+To execute this query optimally (achieving $O(\log N)$ complexity), we must implement a **Composite B-Tree Index**.
+
+The column order inside the index is critical. We follow the rule of thumb for B-Tree composite indexes: **Equality first, Range/Sort second**.
+1. `studentID` (Equality)
+2. `isRead` (Equality)
+3. `createdAt` (Sort)
+
+This order allows MySQL to traverse the B-Tree directly to the exact subset of rows for the student and read state, and inherently retrieve them pre-sorted by `createdAt` without an expensive `filesort`.
+
+**Index Definition:**
+```sql
+CREATE INDEX idx_student_read_created 
+ON notifications (studentID, isRead, createdAt);
+```
+
+### 3. Critical Evaluation: "Add indexes on every column to be safe"
+
+This is an **anti-pattern** and highly detrimental in production for the following reasons:
+* **Write Performance Degradation**: Every `INSERT`, `UPDATE`, or `DELETE` requires MySQL to synchronously update every corresponding B-Tree index. In a high-throughput notification system, over-indexing will cripple bulk insertion rates.
+* **Storage Overhead**: B-Tree indexes consume significant disk space and memory. Indexing every column on a 50M row table can easily double or triple the total database size, pushing valuable data out of the InnoDB Buffer Pool cache.
+* **Query Optimizer Confusion**: Having too many redundant or overlapping indexes can confuse the MySQL query optimizer, causing it to pick a sub-optimal execution plan.
+
+### 4. Additional System Optimizations
+
+* **Cursor-Based Pagination**: Append `AND createdAt > ?` instead of `OFFSET X`. Cursor pagination utilizes the index directly, whereas `OFFSET` forces the engine to scan and discard rows, becoming exponentially slower on deep pages.
+* **Query Limits**: Always append a `LIMIT`. A buggy client without a limit could attempt to fetch tens of thousands of unread notifications, crashing the backend memory.
+* **Archival Strategy (Partitioning)**: Partition the `notifications` table by `RANGE (createdAt)` on a monthly basis. This allows for lightning-fast archiving (dropping an old partition takes milliseconds vs deleting millions of rows) and keeps the active index sizes small.
+
+### 5. New Query Requirement: Placement Notifications (Last 7 Days)
+
+To find all students who received a "placement" notification in the last 7 days optimally:
+
+**Optimized Query:**
+```sql
+SELECT DISTINCT studentID 
+FROM notifications
+WHERE notificationType = 'placement' 
+  AND createdAt >= NOW() - INTERVAL 7 DAY;
+```
+
+**Required Index:**
+```sql
+CREATE INDEX idx_type_created_student 
+ON notifications (notificationType, createdAt, studentID);
+```
