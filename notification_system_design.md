@@ -418,3 +418,113 @@ The optimal production approach is a **hybrid configuration** combining A, B, C,
 * **Latency**: Reduced from ~150ms (SQL disk read) to **<5ms** (Redis memory lookup + SSE).
 * **Database Load**: Primary DB read IOPS reduced by **>95%**. The DB is now primarily an immutable ledger for writes and a fallback for cache misses.
 * **Scalability**: The system transitions from a CPU/Disk-bound architecture to a horizontally scalable Memory/Network-bound architecture. Supporting 500,000 students simply requires scaling the Redis cluster horizontally and adding more stateless SSE nodes, without touching the relational database limits.
+## Stage 5: Reliable Notification Delivery Architecture
+
+### 1. Problem Analysis: The Synchronous Loop Failure
+
+**Current Flawed Implementation:**
+```python
+def notify_all(student_ids, message):
+    for student_id in student_ids:
+        send_email(student_id, message)     # Blocks thread, external network call
+        save_to_db(student_id, message)     # Synchronous DB lock
+        push_to_app(student_id, message)    # Blocks on WebSocket/SSE emit
+```
+
+**Shortcomings & System Risks:**
+* **Sequential Processing Bottleneck**: If `send_email` takes 500ms, processing 50,000 students synchronously will take ~7 hours. The HTTP request will inevitably timeout.
+* **Tight Coupling**: Database insertions, mobile push notifications, and email delivery are chained together. If the third-party Email API experiences an outage, database insertion and app pushes are completely halted.
+* **No Retry or Fault Tolerance**: If the loop crashes at student #20,000 due to a temporary network blip, there is no state tracking. The remaining 30,000 students will never receive the notification, and there is no safe way to resume the job without risking duplicating messages for the first 20,000.
+* **Should DB Writes and Emails be Coupled?** Absolutely not. Internal database writes are highly reliable and fast. External APIs (like SendGrid/AWS SES) are inherently slow and prone to rate-limiting or timeouts. They must be isolated.
+
+### 2. Proposed Solution: Event-Driven Architecture
+
+To achieve true scalability and fault tolerance, we must redesign the system using an **Event-Driven Architecture (EDA)** backed by a **Message Queue** (e.g., Apache Kafka, RabbitMQ, or AWS SQS).
+
+#### Architecture Flow:
+1. **Trigger**: HR clicks "Notify All".
+2. **API (Producer)**: The backend API immediately writes the primary Notification Template to the database and publishes a single `notification.broadcast` event to the Message Queue. It responds with `HTTP 202 Accepted` to the HR dashboard instantly.
+3. **Fan-Out Worker**: A background worker consumes the broadcast event, queries the database for the 50,000 targeted `student_ids`, and generates 50,000 individual `notification.deliver` events, pushing them into respective service queues.
+4. **Dedicated Consumers (Workers)**: 
+   * **Email Workers** consume from the Email Queue.
+   * **Push Workers** consume from the Push/SSE Queue.
+   * **DB Workers** consume from the DB Write Queue.
+
+### 3. Reliability & Performance Enhancements
+
+* **Retry Mechanism & DLQ**: If an email worker fails to deliver an email due to a 5XX error from the provider, the message is placed back in the queue with **Exponential Backoff** (retry in 1s, 5s, 30s, 5m). If it fails after 5 retries, the message is routed to a **Dead-Letter Queue (DLQ)** for manual inspection.
+* **Idempotency**: Message queues guarantee **At-Least-Once Delivery**, meaning a worker might process the same message twice during a network partition. We implement idempotency keys (e.g., `notif_id + student_id + channel`) in Redis. The worker checks if this key was already processed before sending the email.
+* **Horizontal Scaling**: We can spin up 100 Email Worker pods during placement season to process the queue in parallel, reducing the 7-hour synchronous loop down to a few seconds.
+
+### 4. Revised Pseudocode (Event-Driven)
+
+**1. Producer (API Endpoint)**
+```python
+# API Endpoint: POST /notify
+def handle_notify_all_request(audience_criteria, message):
+    # 1. Save core notification template
+    notification_id = db.create_notification(message)
+    
+    # 2. Publish to Fan-Out Queue (O(1) fast response)
+    message_queue.publish(
+        topic="fanout.broadcast",
+        payload={"notification_id": notification_id, "criteria": audience_criteria}
+    )
+    
+    return {"status": "202 Accepted", "job_id": notification_id}
+```
+
+**2. Consumer Workers (Running independently in the background)**
+```python
+# Email Worker (Listens to "queue.email")
+def process_email_job(job):
+    idempotency_key = f"email_{job.notification_id}_{job.student_id}"
+    
+    if redis.exists(idempotency_key):
+        return  # Already sent, skip
+        
+    try:
+        send_email_via_provider(job.student_id, job.message)
+        redis.set(idempotency_key, "done", ttl=86400)
+        job.acknowledge() # Remove from queue
+        
+    except TemporaryNetworkError:
+        job.retry_with_backoff()
+        
+    except PermanentHardBounceError:
+        job.move_to_dlq()
+
+# Push Worker (Listens to "queue.push")
+def process_push_job(job):
+    # Isolated from Email failures. Processes at its own speed.
+    sse_service.emit(job.student_id, job.message)
+    job.acknowledge()
+```
+
+### 5. Architectural Tradeoffs
+
+* **Complexity vs. Reliability**: We sacrifice the simplicity of a single loop for a distributed system requiring queue monitoring, worker deployment, and DLQ management. However, this is a strict requirement for enterprise reliability.
+* **Eventual Consistency**: The HR user receives a "Success" response before the students actually receive the emails. The system is eventually consistent. The UI must be designed to show a "Processing..." progress bar (reading from worker metrics) rather than immediate completion.
+
+## Stage 6: Priority Inbox Implementation
+
+### 1. Approach & Algorithm
+The Priority Inbox guarantees that users immediately see the most critical notifications (Placements > Results > Events) while preserving chronological order within the same category. 
+
+To process a potentially massive incoming stream of $M$ notifications and extract the top $N$ elements, we use a **Min-Heap (Priority Queue)** data structure bounded to size $N$. 
+
+**Scoring Formula:**
+```text
+Score = (TypeWeight * 10,000,000,000,000) + UnixTimestampMs
+```
+*(Where Placement=3, Result=2, Event=1)*
+
+By elevating the `TypeWeight` to a massive magnitude, the category strictly dominates the mathematical score. The `UnixTimestampMs` acts as the fractional tie-breaker, ensuring recent items rank higher within identical categories.
+
+### 2. Time Complexity
+* **Processing:** For every notification in the stream $M$, we attempt to insert it into a Min-Heap of fixed size $N$. Inserting/replacing an element in a Heap of size $N$ takes $O(\log N)$ time.
+* **Total Time Complexity:** **$O(M \log N)$** (where $M$ is total stream size and $N$ is the inbox size limit). 
+* **Space Complexity:** **$O(N)$** because we only ever store $N$ elements in memory, dropping the rest.
+
+### 3. Scalability & Continuous Updates
+This approach scales incredibly well for continuous data streams (like Server-Sent Events). Instead of re-sorting an entire array of millions of notifications ($O(M \log M)$), the backend holds the bounded Min-Heap in memory. As a new notification arrives in real-time, the system calculates its score in $O(1)$ and pushes it into the Heap in $O(\log N)$. If it doesn't beat the current minimum, it is instantly discarded. This means maintaining the Top N feed has virtually zero CPU overhead, even at hyper-scale.
