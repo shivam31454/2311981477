@@ -12,6 +12,7 @@ The project is divided into several directories representing the different compo
   * **Stage 2**: Persistent Storage Design (PostgreSQL schema & Redis caching).
   * **Stage 3**: Query Optimization (MySQL composite indexing strategies).
   * **Stage 4**: Performance Optimization (Caching, SSE, Read Replicas).
+  * **Stage 5**: Reliable Notification Delivery Architecture (Event-Driven, Message Queues).
   * **Stage 6**: Priority Inbox Algorithm design and mathematical scoring formula.
 
 ### 2. Frontend Application (`notification-mui-fe/`)
