@@ -1,0 +1,16 @@
+{
+  "name": "logging-middleware",
+  "version": "1.0.0",
+  "description": "A simple logging middleware for Express",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "express",
+    "middleware",
+    "logging"
+  ],
+  "author": "",
+  "license": "ISC"
+}
