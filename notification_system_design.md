@@ -169,6 +169,114 @@ data: {"unread_count": 5}
   - Read operations update the Redis cache incrementally (`DECR`) while asynchronously updating the persistent DB (Write-Behind caching).
 - **Database Indexing**: The database uses compound indexes on `(user_id, created_at DESC)` and `(user_id, is_read)` to ensure sub-millisecond pagination and unread filtering.
 
+## Stage 2: Persistent Storage Design
+
+### 1. Database Selection & Architecture
+
+**Primary Database: PostgreSQL (Relational SQL)**
+* **Justification**: A notification system requires strong transactional consistency (ACID) for state transitions (e.g., ensuring a notification is not marked read twice concurrently). Relational data models handle the 1-to-N relationships (1 notification template to N user recipients) extremely efficiently. PostgreSQL's robust support for JSONB allows us to maintain rigid schemas for core routing fields while retaining flexibility for arbitrary metadata.
+* **Caching Layer: Redis**: Used heavily as a write-behind cache for `unread_count` increments/decrements and idempotency key storage. It prevents the database from being overwhelmed by high-frequency, low-value read/write queries.
+
+### 2. Schema Design
+
+We separate the notification *content* from the notification *delivery state* to avoid duplicating the payload when broadcasting to thousands of students.
+
+#### Table: `notifications` (The Template)
+Stores the actual content of the broadcast.
+```sql
+CREATE TABLE notifications (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    topic VARCHAR(50) NOT NULL,
+    priority VARCHAR(20) DEFAULT 'normal',
+    title VARCHAR(255) NOT NULL,
+    body TEXT NOT NULL,
+    metadata JSONB DEFAULT '{}'::jsonb,
+    expires_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX idx_notifications_created_at ON notifications(created_at DESC);
+```
+
+#### Table: `user_notifications` (The State)
+Maps the notification to a specific user and tracks delivery/read state.
+```sql
+CREATE TABLE user_notifications (
+    user_id UUID NOT NULL,
+    notification_id UUID NOT NULL REFERENCES notifications(id) ON DELETE CASCADE,
+    is_read BOOLEAN DEFAULT FALSE,
+    read_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (user_id, notification_id)
+);
+-- Optimized for: Fetching user's feed sorted by newest
+CREATE INDEX idx_user_notif_user_created ON user_notifications(user_id, created_at DESC);
+-- Optimized for: Unread counts and filtering
+CREATE INDEX idx_user_notif_unread ON user_notifications(user_id) WHERE is_read = FALSE;
+```
+
+### 3. Query Design
+
+#### 3.1 Fetch Notifications (Keyset / Cursor Pagination)
+*Using `created_at` and `notification_id` as the cursor to avoid `OFFSET` performance degradation.*
+```sql
+SELECT n.id, n.topic, n.priority, n.title, n.body, n.metadata, un.is_read, un.created_at
+FROM user_notifications un
+JOIN notifications n ON un.notification_id = n.id
+WHERE un.user_id = 'user-uuid'
+  AND (un.created_at, un.notification_id) < ('cursor-timestamp', 'cursor-uuid')
+ORDER BY un.created_at DESC, un.notification_id DESC
+LIMIT 20;
+```
+
+#### 3.2 Mark as Read
+*Idempotent query that only updates if currently unread, returning the affected row.*
+```sql
+UPDATE user_notifications
+SET is_read = TRUE, read_at = NOW()
+WHERE user_id = 'user-uuid' 
+  AND notification_id = 'notif-uuid' 
+  AND is_read = FALSE
+RETURNING notification_id;
+```
+
+#### 3.3 Get Unread Count
+*Leverages the partial index `idx_user_notif_unread`.*
+```sql
+SELECT COUNT(*) 
+FROM user_notifications 
+WHERE user_id = 'user-uuid' AND is_read = FALSE;
+```
+
+#### 3.4 Bulk Create Notification Deliveries (Fan-out)
+*Optimized batch insert for broadcasting a notification to a cohort of students.*
+```sql
+INSERT INTO user_notifications (user_id, notification_id)
+SELECT u.id, 'new-notif-uuid'
+FROM users u
+WHERE u.topic_subscription = 'placements'
+ON CONFLICT (user_id, notification_id) DO NOTHING;
+```
+
+### 4. Performance, Reliability & Scaling Strategies
+
+#### 4.1 Scaling Challenges & Practical Solutions
+* **The Bulk Write / Fan-out Problem**: Broadcasting a placement alert to 10,000 students synchronously will lock the database and timeout the API.
+  * **Solution (Async Processing)**: The `/api/v1/notifications` endpoint simply writes the `notifications` template to the DB and pushes a job to a message queue (e.g., RabbitMQ or AWS SQS). Background worker nodes consume the queue and perform batch `INSERT` operations into `user_notifications` in chunks of 500.
+* **High Read Traffic (The Badge Count Issue)**: Every page load polls the unread count, hammering the database.
+  * **Solution (Redis Counter)**: The `unread_count` is stored in Redis (`user:{id}:unread`). When a worker inserts a new row, it runs `INCR user:{id}:unread`. When a user marks a message as read, it runs `DECR user:{id}:unread`. The SQL query is only used as a fallback if the Redis key expires or is evicted.
+
+#### 4.2 Pagination Strategy
+We strictly utilize **Cursor-based (Keyset) Pagination** rather than `OFFSET/LIMIT`. As tables grow into millions of rows, `OFFSET 500000` requires the database to scan and discard half a million rows. Cursors utilize the B-Tree index directly for `O(log N)` lookups regardless of depth.
+
+#### 4.3 Data Archival & Cleanup Strategy (Time-To-Live)
+Notification tables grow infinitely. Retaining old data severely degrades index size and cache hit ratios.
+* **Partitioning**: The `user_notifications` table is partition-bound by `RANGE (created_at)` grouped by month.
+* **Cron Cleanup**: A nightly cron job drops partitions older than 90 days. For transient alerts (e.g., "Event starts in 1 hour"), a background worker hard-deletes rows where `notifications.expires_at < NOW()`.
+
+#### 4.4 Idempotency Handling
+Network retries can result in duplicate push notifications. 
+* A Redis cache stores the `Idempotency-Key` provided in the request headers (`SET key "processed" EX 86400 NX`). If `NX` (Not Exists) fails, the request is rejected as a duplicate before any database transaction begins.
+
 ## Stage 3: Query Optimization & Performance Analysis
 
 ### 1. Query Review & Performance Analysis
